@@ -46,13 +46,28 @@ class scRNADataset(Dataset):
         """Return total number of samples."""
         return len(self.train_set)
 
-    def Adj_Generate(self, TF_set, direction=False, loop=False):
+    def Adj_Generate(self, TF_set, direction=True, loop=False):
         """
         Generate adjacency matrix from training regulatory links.
 
+        Following Eq. 12 of the manuscript, A is a *directed* adjacency matrix
+        that stores TF -> target edges only, i.e. A[tf, target] = 1 whenever
+        (tf, target) is a positive training link.  The reverse (target -> TF)
+        relations used by the backward branch of the direction-aware layers are
+        obtained by transposing A inside the model, therefore they must NOT be
+        written into A here: writing both directions makes A symmetric, the
+        forward and backward branches then see the same neighbourhood, and the
+        model degenerates to an undirected message-passing network
+        (this was the defect reported in R3-Major 2).
+
         Args:
-            TF_set: Set of transcription factor indices
-            direction: Whether to use directed adjacency (default: False)
+            TF_set: Set of transcription factor indices. Kept for backward
+                compatibility with the released interface; not needed by the
+                directed construction.
+            direction: Whether to build the directed adjacency (default: True).
+                Setting it to False restores the undirected construction used
+                by the code released with the first submission and is kept only
+                for reproducing those legacy runs.
             loop: Whether to add self-loops (default: False)
 
         Returns:
@@ -62,20 +77,19 @@ class scRNADataset(Dataset):
         adj = sp.dok_matrix((self.num_gene, self.num_gene), dtype=np.float32)
 
         for pos in self.train_set:
-            tf = pos[0]
-            target = pos[1]
+            tf = int(pos[0])
+            target = int(pos[1])
 
-            if direction == False:
-                # Undirected: both TF→Target and Target→TF
-                if pos[-1] == 1:
-                    adj[tf, target] = 1.0
-                    adj[target, tf] = 1.0
-            else:
-                # Directed: only TF→Target, but bidirectional if target is also a TF
-                if pos[-1] == 1:
-                    adj[tf, target] = 1.0
-                    if target in TF_set:
-                        adj[target, tf] = 1.0
+            # Only positive regulatory links contribute to the graph
+            if pos[-1] != 1:
+                continue
+
+            # Directed edge TF -> target (always)
+            adj[tf, target] = 1.0
+
+            if not direction:
+                # Legacy undirected behaviour: also add target -> TF
+                adj[target, tf] = 1.0
 
         # Add self-loops if specified
         if loop:

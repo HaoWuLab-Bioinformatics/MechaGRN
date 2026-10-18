@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -185,10 +187,22 @@ class DirectionAwareGraphLayer(nn.Module):
             embed_dim, num_heads, dropout=dropout, batch_first=True
         )
 
-        # Weighting factors for directional information
-        self.alpha = nn.Parameter(torch.tensor(0.9), requires_grad=False)  # Forward weight
-        self.beta = nn.Parameter(torch.tensor(0.1), requires_grad=False)   # Backward weight
-        self.wolf = nn.Parameter(torch.tensor(0.01), requires_grad=False)  # Residual weight
+        # Direction weighting factors, layer-specific and *learnable*, Eq. 13:
+        #     [alpha_l, beta_l] = softmax([a_l, b_l])
+        # The two logits are initialised so that softmax([a_l, b_l]) = (0.9, 0.1),
+        # i.e. the same starting point as the frozen weights used in the code
+        # released with the first submission, but the weights are now optimised
+        # end-to-end by the training loss and stay on the probability simplex
+        # (alpha_l + beta_l = 1, alpha_l, beta_l > 0).
+        self.dir_logits = nn.Parameter(
+            torch.tensor([math.log(0.9), math.log(0.1)], dtype=torch.float32)
+        )
+
+        # Residual coefficient of the transmission block (Eq. 12).
+        # Learnable, but initialised at 0.01 so that the very first forward pass
+        # is identical to the previously released implementation; from then on
+        # the coefficient is optimised together with the rest of the model.
+        self.wolf = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))  # Residual weight
 
         # Feed-forward network
         self.ffn = nn.Sequential(
@@ -201,6 +215,26 @@ class DirectionAwareGraphLayer(nn.Module):
         self.norm2 = nn.LayerNorm(embed_dim)
 
         self.dropout = nn.Dropout(dropout)
+
+    @property
+    def alpha(self):
+        """Forward-direction weight alpha_l = softmax([a_l, b_l])[0] (Eq. 13)."""
+        return torch.softmax(self.dir_logits, dim=0)[0]
+
+    @property
+    def beta(self):
+        """Backward-direction weight beta_l = softmax([a_l, b_l])[1] (Eq. 13)."""
+        return torch.softmax(self.dir_logits, dim=0)[1]
+
+    def direction_weights(self):
+        """
+        Return the current (alpha_l, beta_l) pair as detached floats.
+
+        Useful for logging the learned directional weights after training.
+        """
+        with torch.no_grad():
+            w = torch.softmax(self.dir_logits, dim=0)
+        return float(w[0]), float(w[1])
 
     def forward(self, x, adj):
         """
@@ -236,8 +270,11 @@ class DirectionAwareGraphLayer(nn.Module):
             x, x, x, attn_mask=mask_backward
         )
 
-        # Combine directional information
-        out = self.alpha * out_forward + self.beta * out_backward
+        # Combine directional information, Eq. 13:
+        #   H_dir = alpha_l * H_forward + beta_l * H_backward
+        #   [alpha_l, beta_l] = softmax([a_l, b_l])
+        alpha, beta = torch.softmax(self.dir_logits, dim=0)
+        out = alpha * out_forward + beta * out_backward
         out = self.dropout(out)
 
         x = self.norm1(x + out)
@@ -270,8 +307,13 @@ class HighOrderPerceptionLayer(nn.Module):
 
         self.linear = nn.Linear(dim, dim)
 
-        # Controls high-order information strength
-        self.gamma = nn.Parameter(torch.tensor(0.01), requires_grad=False)
+        # Controls high-order information strength (Eq. 17):
+        #     H_out = lambda_ho * H + H_high
+        # Learnable scalar, initialised at 0.01 to match the released
+        # implementation at step 0.  Named lambda_ho rather than gamma so that
+        # it is not confused with the focal-loss focusing parameter gamma
+        # of Eq. 21.
+        self.lambda_ho = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
 
         self.norm = nn.LayerNorm(dim)
 
@@ -307,7 +349,7 @@ class HighOrderPerceptionLayer(nn.Module):
         h_ho = F.gelu(h_ho)
 
         # Combine with original embeddings
-        out = self.gamma * x + h_ho
+        out = self.lambda_ho * x + h_ho
 
         out = self.norm(out)
 

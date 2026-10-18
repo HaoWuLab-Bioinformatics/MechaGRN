@@ -18,6 +18,18 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 warnings.filterwarnings(action='ignore', category=FutureWarning)
 
 # ======================== Hyperparameters ========================
+def str2bool(value):
+    """Robust boolean parsing for argparse (type=bool silently accepts 'False')."""
+    if isinstance(value, bool):
+        return value
+    v = str(value).strip().lower()
+    if v in ('1', 'true', 't', 'yes', 'y'):
+        return True
+    if v in ('0', 'false', 'f', 'no', 'n', ''):
+        return False
+    raise argparse.ArgumentTypeError(f'Boolean value expected, got {value!r}')
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate for optimizer')
 parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
@@ -25,7 +37,20 @@ parser.add_argument('--hidden_dim', type=int, default=32, help='Hidden dimension
 parser.add_argument('--output_dim', type=int, default=16, help='Output embedding dimension')
 parser.add_argument('--num_heads', type=int, default=4, help='Number of attention heads')
 parser.add_argument('--batch_size', type=int, default=256, help='Training batch size')
-parser.add_argument('--loop', type=bool, default=False, help='Whether to add self-loops to adjacency matrix')
+parser.add_argument(
+    '--direction', type=str2bool, default=True,
+    help='Build a directed TF->target adjacency matrix (Eq. 12). '
+         'Set to False only to reproduce the legacy undirected code path.'
+)
+parser.add_argument('--loop', type=str2bool, default=False, help='Whether to add self-loops to adjacency matrix')
+parser.add_argument(
+    '--focal_alpha', type=float, default=0.8,
+    help='Focal-loss positive-class weight (Eq. 21)'
+)
+parser.add_argument(
+    '--focal_gamma', type=float, default=2.5,
+    help='Focal-loss focusing parameter (Eq. 21)'
+)
 parser.add_argument('--seed', type=int, default=40, help='Random seed for reproducibility')
 args = parser.parse_args()
 
@@ -36,6 +61,57 @@ random.seed(seed)
 torch.manual_seed(seed)
 np.random.seed(seed)
 torch.cuda.manual_seed_all(seed)
+
+# ======================== Checkpoint compatibility ========================
+
+def load_state_dict_compat(model, path, device):
+    """
+    Load a checkpoint written by either the current or the previously released
+    code.
+
+    The first release stored the directional weights of each
+    DirectionAwareGraphLayer as two frozen scalars (`alpha`, `beta`, fixed at
+    0.9 / 0.1).  The current code stores them as the two logits `dir_logits`
+    of Eq. 13.  Legacy checkpoints are translated on the fly so that archived
+    runs stay inspectable; the translated logits are log(alpha), log(beta),
+    whose softmax reproduces the frozen pair exactly.
+
+    Args:
+        model: MechaGRN instance
+        path: checkpoint path (state_dict saved by torch.save)
+        device: device used for map_location
+
+    Returns:
+        The same model instance with the checkpoint loaded
+    """
+    state = torch.load(path, map_location=device)
+
+    legacy_layers = sorted({k.split('.')[0] for k in state if k.endswith('.alpha')})
+    if legacy_layers:
+        print(f"[Compat] legacy checkpoint detected, translating directional "
+              f"weights for: {', '.join(legacy_layers)}")
+        for layer_name in legacy_layers:
+            key_a = f'{layer_name}.alpha'
+            key_b = f'{layer_name}.beta'
+            if key_a in state and key_b in state:
+                a = float(state.pop(key_a))
+                b = float(state.pop(key_b))
+                state[f'{layer_name}.dir_logits'] = torch.log(torch.tensor([a, b]))
+                print(f"[Compat] {layer_name}: frozen (alpha, beta) = ({a:.4f}, {b:.4f})")
+
+    # Parameters that were renamed in this revision (old name -> new name).
+    # `high_order.gamma` is now `high_order.lambda_ho`, so that the high-order
+    # fusion coefficient of Eq. 17 is not confused with the focal-loss focusing
+    # parameter gamma of Eq. 21.
+    renames = {'high_order.gamma': 'high_order.lambda_ho'}
+    for old_key, new_key in renames.items():
+        if old_key in state and new_key not in state:
+            state[new_key] = state.pop(old_key)
+            print(f"[Compat] renamed checkpoint key: {old_key} -> {new_key}")
+
+    # strict=True: every remaining parameter must match exactly
+    model.load_state_dict(state, strict=True)
+    return model
 
 # ======================== Run Model ========================
 
@@ -78,8 +154,16 @@ def Running_Model(net_type, cell_type, gene_num, record_model):
     # Construct sparse adjacency matrix from training links
     train_data = pd.read_csv(train_file, index_col=0).values
     train_load = scRNADataset(train_data, feature.shape[0])
-    adj = train_load.Adj_Generate(tf, loop=args.loop)
+    adj = train_load.Adj_Generate(tf, direction=args.direction, loop=args.loop)
     adj = adj2saprse_tensor(adj).to(device)
+
+    # Report the graph construction actually used (recorded in the run log)
+    adj_sym = bool(torch.equal(adj.to_dense(), adj.to_dense().T))
+    print(
+        f"[Config] directed_adjacency={args.direction} | self_loops={args.loop} | "
+        f"edges={int((adj.to_dense() > 0).sum())} | adjacency_is_symmetric={adj_sym} | "
+        f"focal_alpha={args.focal_alpha} | focal_gamma={args.focal_gamma} | seed={args.seed}"
+    )
 
     # ======================== Validation & Test Data ========================
     # Load validation and test samples as tensors
@@ -104,8 +188,11 @@ def Running_Model(net_type, cell_type, gene_num, record_model):
         optimizer,
         T_max=args.epochs
     )
-    # Use Focal Loss to handle class imbalance in regulatory links
-    loss_focal = FocalLoss(alpha=0.8, gamma=2.5)
+    # Use Focal Loss to handle class imbalance in regulatory links (Eq. 21).
+    # alpha/gamma are exposed on the command line so that every reported run is
+    # reproducible from its log line, and so that the sensitivity analysis over
+    # (alpha, gamma) can be repeated with the same entry point.
+    loss_focal = FocalLoss(alpha=args.focal_alpha, gamma=args.focal_gamma)
 
     # Create directory for saving best model
     model_path = f'model/{net_type}/{cell_type} {gene_num}'
@@ -160,7 +247,16 @@ def Running_Model(net_type, cell_type, gene_num, record_model):
     # Load best model and evaluate on test set
     print("=========== Testing ==========")
 
-    model.load_state_dict(torch.load(model_path + '/best_model.pkl'))
+    model = load_state_dict_compat(model, model_path + '/best_model.pkl', device)
+
+    # Log the learned scalar coefficients (Eq. 12, Eq. 13, Eq. 17)
+    for name in ('graph_layer1', 'graph_layer2'):
+        layer = getattr(model, name)
+        a, b = layer.direction_weights()
+        print(f"[DirectionWeights] {name}: alpha_l={a:.4f} beta_l={b:.4f} (sum={a + b:.4f})")
+        print(f"[ResidualWeight]   {name}: wolf={float(layer.wolf):.6f}")
+    print(f"[HighOrderWeight]  high_order: lambda_ho={float(model.high_order.lambda_ho):.6f}")
+
     model.eval()
 
     with torch.no_grad():

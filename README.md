@@ -13,6 +13,78 @@ The model incorporates:
 - **Expression-aware encoding with sparsity gating** — encodes raw expression together with statistical features (mean, variance, dropout rate) and gates them to handle the high sparsity of single-cell data.
 - **Focal Loss** — addresses the severe positive/negative class imbalance typical of GRN datasets.
 
+## Directional formulation (Eq. 12–13)
+
+The graph fed to the two direction-aware attention branches is the **directed**
+TF → target skeleton of the training links, `A[tf, target] = 1`. The two
+branches are
+
+- forward: `H_forward = Attn(A, X)` — a target aggregates over its incoming TFs;
+- backward: `H_backward = Attn(Aᵀ, X)` — a TF aggregates over its targets;
+
+combined with layer-specific, learnable weights constrained to a probability
+simplex,
+
+```
+[α_ℓ, β_ℓ] = softmax([a_ℓ, b_ℓ])          α_ℓ + β_ℓ = 1,  α_ℓ, β_ℓ > 0
+H_dir      = α_ℓ · H_forward + β_ℓ · H_backward
+```
+
+Each `DirectionAwareGraphLayer` owns its own `dir_logits = [a_ℓ, b_ℓ]`, so the
+two layers may weight the two directions differently. The logits are
+initialised at `[log 0.9, log 0.1]`, which reproduces the `(0.9, 0.1)` starting
+point of earlier experiments while leaving the weights free to be optimised
+end-to-end.
+
+After training the learned coefficients are printed for the record:
+
+```
+[DirectionWeights] graph_layer1: alpha_l=... beta_l=... (sum=1.0000)
+[ResidualWeight]   graph_layer1: wolf=...
+[DirectionWeights] graph_layer2: alpha_l=... beta_l=... (sum=1.0000)
+[ResidualWeight]   graph_layer2: wolf=...
+[HighOrderWeight]  high_order: lambda_ho=...
+```
+
+The high-order coefficient of Eq. 17 is called `lambda_ho` in the code, so that
+it is never confused with the focal-loss focusing parameter γ of Eq. 21.
+
+### Changes relative to the first release
+
+Two defects of the code released with the first submission are fixed here
+(reviewer 3, Major 2):
+
+| | first release | this revision |
+|---|---|---|
+| adjacency | `A[tf,target] = A[target,tf] = 1` (undirected) | `A[tf,target] = 1` only (directed, Eq. 12) |
+| `Aᵀ` branch | identical to `A`, branches saw the same neighbourhood | genuinely reversed message flow |
+| direction weights | frozen scalars `requires_grad=False`, 0.9 / 0.1 | learnable logits, softmax-normalised (Eq. 13) |
+| residual coefficient (`wolf`) | frozen scalar, 0.01 | learnable scalar, initialised at 0.01 |
+| high-order coefficient (`lambda_ho`, Eq. 17) | frozen scalar, 0.01 | learnable scalar, initialised at 0.01 |
+| focal loss `alpha` / `gamma` | hard-coded in `main.py` | command-line flags, logged at start-up |
+| checkpoint keys | `…alpha`, `…beta`, `high_order.gamma` | `…dir_logits`, `high_order.lambda_ho` (auto-translated on load) |
+| boolean flags | `type=bool` (silently turns `'False'` into `True`) | strict `str2bool` parsing |
+
+Reproducibility notes:
+
+- `--direction False` restores the legacy undirected graph, so runs produced by
+  the first release remain reproducible with the same entry point.
+- Checkpoints written by the first release (which stored `…alpha` / `…beta`)
+  are translated automatically on load, so archived `best_model.pkl` files stay
+  inspectable.
+- `Code/tests/test_direction_adjacency.py` pins the corrected behaviour and
+  runs on a bare Python + NumPy installation (no `torch`, no `scipy`).
+
+```bash
+python main.py --direction True --loop False --focal_alpha 0.8 --focal_gamma 2.5 --seed 40
+```
+
+Every run prints one line that fully determines the configuration, e.g.
+
+```
+[Config] directed_adjacency=True | self_loops=False | edges=... | adjacency_is_symmetric=False | focal_alpha=0.8 | focal_gamma=2.5 | seed=40
+```
+
 ## Project Structure
 
 ```
