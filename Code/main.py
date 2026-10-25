@@ -44,11 +44,11 @@ parser.add_argument(
 )
 parser.add_argument('--loop', type=str2bool, default=False, help='Whether to add self-loops to adjacency matrix')
 parser.add_argument(
-    '--focal_alpha', type=float, default=0.8,
+    '--focal_alpha', type=float, default=0.75,
     help='Focal-loss positive-class weight (Eq. 21)'
 )
 parser.add_argument(
-    '--focal_gamma', type=float, default=2.5,
+    '--focal_gamma', type=float, default=2.0,
     help='Focal-loss focusing parameter (Eq. 21)'
 )
 parser.add_argument('--seed', type=int, default=40, help='Random seed for reproducibility')
