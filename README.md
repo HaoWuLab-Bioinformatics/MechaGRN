@@ -32,9 +32,9 @@ H_dir      = α_ℓ · H_forward + β_ℓ · H_backward
 
 Each `DirectionAwareGraphLayer` owns its own `dir_logits = [a_ℓ, b_ℓ]`, so the
 two layers may weight the two directions differently. The logits are
-initialised at `[log 0.9, log 0.1]`, which reproduces the `(0.9, 0.1)` starting
-point of earlier experiments while leaving the weights free to be optimised
-end-to-end.
+initialized at `[log 0.9, log 0.1]`, so training starts from
+`(α_ℓ, β_ℓ) = (0.9, 0.1)` and the split between the two directions is then
+learned end-to-end from the data.
 
 After training the learned coefficients are printed for the record:
 
@@ -46,43 +46,46 @@ After training the learned coefficients are printed for the record:
 [HighOrderWeight]  high_order: lambda_ho=...
 ```
 
-The high-order coefficient of Eq. 17 is called `lambda_ho` in the code, so that
-it is never confused with the focal-loss focusing parameter γ of Eq. 21.
+The high-order coefficient of Eq. 17 is stored as `lambda_ho` in the code, so
+that it is not confused with the focal-loss focusing parameter γ of Eq. 21.
 
-### Changes relative to the first release
+### Configuration and reproducibility
 
-Two defects of the code released with the first submission are fixed here
-(reviewer 3, Major 2):
+The directional coefficients `α_ℓ, β_ℓ`, the residual coefficient `wolf` and the
+high-order coefficient `lambda_ho` are trainable parameters, optimized together
+with the rest of the network. The remaining choices are exposed as command-line
+flags rather than hard-coded values, and each run prints both its resolved
+configuration and the fitted coefficients, so a run can be reconstructed from
+its log alone.
 
-| | first release | this revision |
-|---|---|---|
-| adjacency | `A[tf,target] = A[target,tf] = 1` (undirected) | `A[tf,target] = 1` only (directed, Eq. 12) |
-| `Aᵀ` branch | identical to `A`, branches saw the same neighbourhood | genuinely reversed message flow |
-| direction weights | frozen scalars `requires_grad=False`, 0.9 / 0.1 | learnable logits, softmax-normalised (Eq. 13) |
-| residual coefficient (`wolf`) | frozen scalar, 0.01 | learnable scalar, initialised at 0.01 |
-| high-order coefficient (`lambda_ho`, Eq. 17) | frozen scalar, 0.01 | learnable scalar, initialised at 0.01 |
-| focal loss `alpha` / `gamma` | hard-coded in `main.py` | command-line flags, logged at start-up |
-| checkpoint keys | `…alpha`, `…beta`, `high_order.gamma` | `…dir_logits`, `high_order.lambda_ho` (auto-translated on load) |
-| boolean flags | `type=bool` (silently turns `'False'` into `True`) | strict `str2bool` parsing |
+| Flag / item | Behavior |
+|---|---|
+| `--direction` | `True` (default) builds the directed TF → target graph of Eq. 12; `False` builds the symmetric undirected graph, used as an ablation |
+| `--loop` | `False` (default) leaves self-loops out of the adjacency matrix |
+| `--focal_alpha`, `--focal_gamma` | the two focal-loss parameters of Eq. 21 (defaults `0.75` and `2.0`, as used for all benchmark runs) |
+| `--seed` | fixes the `random`, `numpy`, `torch` and CUDA seeds |
+| Boolean flags | parsed by `str2bool`, so `--direction False` is read as `False` |
+| Checkpoint keys | `…dir_logits` and `…high_order.lambda_ho`; `load_state_dict_compat` additionally maps archives that store `…alpha` / `…beta` / `high_order.gamma`, so saved `best_model.pkl` files remain loadable |
 
-Reproducibility notes:
-
-- `--direction False` restores the legacy undirected graph, so runs produced by
-  the first release remain reproducible with the same entry point.
-- Checkpoints written by the first release (which stored `…alpha` / `…beta`)
-  are translated automatically on load, so archived `best_model.pkl` files stay
-  inspectable.
-- `Code/tests/test_direction_adjacency.py` pins the corrected behaviour and
-  runs on a bare Python + NumPy installation (no `torch`, no `scipy`).
+`Code/tests/test_direction_adjacency.py` checks the adjacency orientation, the
+handling of negative training rows and the softmax-normalized directional
+coefficients. It deliberately does not import `torch` or `scipy`, so it runs on
+a bare Python + NumPy installation:
 
 ```bash
-python main.py --direction True --loop False --focal_alpha 0.8 --focal_gamma 2.5 --seed 40
+python Code/tests/test_direction_adjacency.py
 ```
 
-Every run prints one line that fully determines the configuration, e.g.
+A typical run from the `Code/` directory:
+
+```bash
+python main.py --direction True --loop False --focal_alpha 0.75 --focal_gamma 2.0 --seed 40
+```
+
+and the configuration line it reports:
 
 ```
-[Config] directed_adjacency=True | self_loops=False | edges=... | adjacency_is_symmetric=False | focal_alpha=0.8 | focal_gamma=2.5 | seed=40
+[Config] directed_adjacency=True | self_loops=False | edges=... | adjacency_is_symmetric=False | focal_alpha=0.75 | focal_gamma=2.0 | seed=40
 ```
 
 ## Project Structure
@@ -94,7 +97,9 @@ MechaGRN/
 │   ├── Model.py           # Neural network models (MechaGRN + submodules)
 │   ├── preprocessing.py   # Data loading, normalization, adjacency building, network stats
 │   ├── DatasetsSplit.py   # Train/validation/test split utilities
-│   └── Tools.py           # Evaluation metrics, best-model saving, logging
+│   ├── Tools.py           # Evaluation metrics, best-model saving, logging
+│   └── tests/
+│       └── test_direction_adjacency.py  # Edge-direction regression tests
 ├── Dataset/
 │   ├── Benchmark Dataset/  # Raw benchmark data (expression + ground-truth network)
 │   ├── train/              # Pre-split training edge sets
@@ -240,7 +245,10 @@ The `net_type`, `cell_type`, and `gene_num` are configured directly in the `__ma
 | `--output_dim` | 16 | Output embedding dimension |
 | `--num_heads` | 4 | Number of attention heads |
 | `--batch_size` | 256 | Training batch size |
+| `--direction` | True | Build a directed TF → target adjacency matrix (Eq. 12); `False` builds the undirected graph used for the ablation |
 | `--loop` | False | Whether to add self-loops to the adjacency matrix |
+| `--focal_alpha` | 0.75 | Focal-loss positive-class weight (Eq. 21) |
+| `--focal_gamma` | 2.0 | Focal-loss focusing parameter (Eq. 21) |
 | `--seed` | 40 | Random seed for reproducibility |
 
 ### 2. Advanced: Regenerating splits
